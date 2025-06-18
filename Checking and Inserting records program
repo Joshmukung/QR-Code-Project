@@ -1,0 +1,446 @@
+Imports System.ServiceProcess
+Imports System.Diagnostics
+Imports System.IO
+Imports System.Timers
+Imports System.Configuration
+Imports System.Collections.Generic
+Imports System.Linq
+Imports System ' For AppDomain
+Imports System.Management ' Fixed: Added for process tree killing
+
+Namespace ABMWindowsService
+    Public Class MonitoredApplicationsConfigSection
+        Inherits ConfigurationSection
+
+        <ConfigurationProperty("applications", IsDefaultCollection:=True)>
+        Public ReadOnly Property Applications As ApplicationConfigElementCollection
+            Get
+                Return DirectCast(Me("applications"), ApplicationConfigElementCollection)
+            End Get
+        End Property
+
+        Public Shared Function GetConfig() As MonitoredApplicationsConfigSection
+            Return DirectCast(ConfigurationManager.GetSection("monitoredApplications"), MonitoredApplicationsConfigSection)
+        End Function
+    End Class
+
+    Public Class ApplicationConfigElement
+        Inherits ConfigurationElement
+
+        <ConfigurationProperty("name", IsRequired:=True, IsKey:=True)>
+        Public Property Name As String
+            Get
+                Return DirectCast(Me("name"), String)
+            End Get
+            Set(value As String)
+                Me("name") = value
+            End Set
+        End Property
+
+        <ConfigurationProperty("path", IsRequired:=True)>
+        Public Property Path As String
+            Get
+                Return DirectCast(Me("path"), String)
+            End Get
+            Set(value As String)
+                Me("path") = value
+            End Set
+        End Property
+
+        <ConfigurationProperty("workingDirectory", IsRequired:=True)>
+        Public Property WorkingDirectory As String
+            Get
+                Return DirectCast(Me("workingDirectory"), String)
+            End Get
+            Set(value As String)
+                Me("workingDirectory") = value
+            End Set
+        End Property
+
+        <ConfigurationProperty("monitoringIntervalSeconds", IsRequired:=False, DefaultValue:=30)>
+        Public Property MonitoringIntervalSeconds As Integer
+            Get
+                Return DirectCast(Me("monitoringIntervalSeconds"), Integer)
+            End Get
+            Set(value As Integer)
+                Me("monitoringIntervalSeconds") = value
+            End Set
+        End Property
+
+        <ConfigurationProperty("arguments", IsRequired:=False, DefaultValue:="")>
+        Public Property Arguments As String
+            Get
+                Return DirectCast(Me("arguments"), String)
+            End Get
+            Set(value As String)
+                Me("arguments") = value
+            End Set
+        End Property
+    End Class
+
+    <ConfigurationCollection(GetType(ApplicationConfigElement), AddItemName:="application", CollectionType:=ConfigurationElementCollectionType.BasicMap)>
+    Public Class ApplicationConfigElementCollection
+        Inherits ConfigurationElementCollection
+
+        Protected Overrides Function CreateNewElement() As ConfigurationElement
+            Return New ApplicationConfigElement()
+        End Function
+
+        Protected Overrides Function GetElementKey(element As ConfigurationElement) As Object
+            Return DirectCast(element, ApplicationConfigElement).Name
+        End Function
+
+        Default Public ReadOnly Property Item(name As String) As ApplicationConfigElement
+            Get
+                Return DirectCast(Me.BaseGet(name), ApplicationConfigElement)
+            End Get
+        End Property
+    End Class
+
+    Public Class ApplicationMonitorInfo
+        Public Property Config As ApplicationConfigElement
+        Public Property LaunchedProcess As Process
+        Public WithEvents MonitorTimer As Timer
+        Public Property LastActivityTime As DateTime
+
+        Public Sub New(appConfig As ApplicationConfigElement)
+            Me.Config = appConfig
+            Me.MonitorTimer = New Timer()
+            Me.MonitorTimer.Interval = appConfig.MonitoringIntervalSeconds * 1000
+            Me.MonitorTimer.AutoReset = True
+            Me.LastActivityTime = DateTime.Now
+        End Sub
+    End Class
+
+    Public Class ApplicationMonitorService
+        Inherits ServiceBase
+
+        Private _logFilePath As String
+        Private _monitoredApplications As List(Of ApplicationMonitorInfo)
+        Private ReadOnly _lockObject As New Object()
+        Private WithEvents _restartTimer As Timer ' For 30-minute forced restarts
+
+        Public Sub New()
+            Me.ServiceName = "ApplicationMonitorService"
+            Me.CanStop = True
+            Me.CanPauseAndContinue = False
+            Me.AutoLog = True
+
+            _monitoredApplications = New List(Of ApplicationMonitorInfo)()
+        End Sub
+
+        Protected Overrides Sub OnStart(args() As String)
+            Try
+                InitializeService()
+                LogMessage("Service starting...")
+
+                ' Start the periodic restart timer
+                _restartTimer.Start()
+                LogMessage($"Periodic restart timer started (Interval: {_restartTimer.Interval / 60000} minutes)")
+
+                ' Start application monitoring
+                For Each appInfo In _monitoredApplications
+                    Try
+                        AddHandler appInfo.MonitorTimer.Elapsed, AddressOf OnMonitorTimerElapsed
+                        StartApplication(appInfo)
+                        appInfo.MonitorTimer.Start()
+                        LogMessage($"Started monitoring for {appInfo.Config.Name}")
+                    Catch ex As Exception
+                        LogMessage($"Failed to start monitoring for {appInfo.Config.Name}: {ex.Message}", True)
+                    End Try
+                Next
+
+                LogMessage("Service started successfully")
+            Catch ex As Exception
+                LogMessage($"Service failed to start: {ex.Message}", True)
+                Throw
+            End Try
+        End Sub
+
+        Protected Overrides Sub OnStop()
+            LogMessage("Service stopping...")
+
+            ' Stop the restart timer
+            _restartTimer.Stop()
+            LogMessage("Periodic restart timer stopped")
+
+            For Each appInfo In _monitoredApplications
+                Try
+                    appInfo.MonitorTimer.Stop()
+                    RemoveHandler appInfo.MonitorTimer.Elapsed, AddressOf OnMonitorTimerElapsed
+
+                    If appInfo.LaunchedProcess IsNot Nothing AndAlso Not appInfo.LaunchedProcess.HasExited Then
+                        Try
+                            ' Kill entire process tree during service stop
+                            KillProcessTree(appInfo.LaunchedProcess)
+                        Catch ex As Exception
+                            LogMessage($"Error stopping {appInfo.Config.Name}: {ex.Message}")
+                        End Try
+                    End If
+                Catch ex As Exception
+                    LogMessage($"Error during shutdown for {appInfo.Config.Name}: {ex.Message}")
+                End Try
+            Next
+
+            LogMessage("Service stopped")
+        End Sub
+
+        Private Sub InitializeService()
+            Try
+                _logFilePath = ConfigurationManager.AppSettings("ServiceLogFilePath")
+                If String.IsNullOrEmpty(_logFilePath) Then
+                    _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ApplicationMonitorService.log")
+                End If
+
+                ' Ensure log directory exists
+                Dim logDir = Path.GetDirectoryName(_logFilePath)
+                If Not Directory.Exists(logDir) AndAlso Not String.IsNullOrEmpty(logDir) Then
+                    Directory.CreateDirectory(logDir)
+                End If
+
+                ' Hardcoded applications to monitor
+                Dim hardcodedApps As New List(Of ApplicationConfigElement) From {
+                    New ApplicationConfigElement With {
+                        .Name = "ABMScanningApp",
+                        .Path = "C:\Program Files (x86)\Krystal Scanning Mobility Group\ABM Scanning APP\ABM.exe",
+                        .WorkingDirectory = "C:\Program Files (x86)\Krystal Scanning Mobility Group\ABM Scanning APP",
+                        .MonitoringIntervalSeconds = 30,
+                        .Arguments = ""
+                    },
+                    New ApplicationConfigElement With {
+                        .Name = "Xampp",
+                        .Path = "C:\xampp\xampp-control.exe",
+                        .WorkingDirectory = "C:\xampp",
+                        .MonitoringIntervalSeconds = 30,
+                        .Arguments = ""
+                    },
+                    New ApplicationConfigElement With {
+                        .Name = "ABM Console App",
+                        .Path = "C:\Program Files (x86)\Krystal Scanning Mobility Group\ABM ConsoleAPP\ABM Console App.exe",
+                        .WorkingDirectory = "C:\Program Files (x86)\Krystal Scanning Mobility Group\ABM ConsoleAPP",
+                        .MonitoringIntervalSeconds = 30,
+                        .Arguments = ""
+                    }
+                }
+
+                ' Add hardcoded applications to monitoring list
+                For Each appConfig As ApplicationConfigElement In hardcodedApps
+                    _monitoredApplications.Add(New ApplicationMonitorInfo(appConfig))
+                Next
+
+                ' Initialize periodic restart timer (30 minutes)
+                _restartTimer = New Timer()
+                _restartTimer.Interval = 30 * 60 * 1000 ' 30 minutes in milliseconds
+                _restartTimer.AutoReset = True
+
+                If _monitoredApplications.Count = 0 Then
+                    LogMessage("Warning: No applications configured for monitoring", True)
+                End If
+            Catch ex As Exception
+                LogMessage($"Service initialization failed: {ex.Message}", True)
+                Throw
+            End Try
+        End Sub
+
+        ' Handle periodic monitoring checks
+        Private Sub OnMonitorTimerElapsed(sender As Object, e As ElapsedEventArgs)
+            Dim timer = DirectCast(sender, Timer)
+            Dim appInfo = _monitoredApplications.FirstOrDefault(Function(a) a.MonitorTimer Is timer)
+
+            If appInfo Is Nothing Then Return
+
+            SyncLock _lockObject
+                Try
+                    If appInfo.LaunchedProcess Is Nothing OrElse appInfo.LaunchedProcess.HasExited Then
+                        LogMessage($"{appInfo.Config.Name} is not running. Restarting...")
+                        StartApplication(appInfo)
+                    ElseIf Not IsProcessResponding(appInfo.LaunchedProcess) Then
+                        LogMessage($"{appInfo.Config.Name} is not responding. Restarting...", True)
+                        RestartApplication(appInfo)
+                    Else
+                        appInfo.LastActivityTime = DateTime.Now
+                        LogMessage($"{appInfo.Config.Name} is running normally (PID: {appInfo.LaunchedProcess.Id})")
+                    End If
+                Catch ex As Exception
+                    LogMessage($"Error monitoring {appInfo.Config.Name}: {ex.Message}", True)
+                End Try
+            End SyncLock
+        End Sub
+
+        ' Handle periodic forced restarts
+        Private Sub RestartTimerElapsed(sender As Object, e As ElapsedEventArgs) Handles _restartTimer.Elapsed
+            LogMessage("Initiating scheduled restart for ABM applications...")
+            RestartTargetApplications({"ABMScanningApp", "ABM Console App"})
+        End Sub
+
+        ' Restart specific applications by name
+        Private Sub RestartTargetApplications(appNames As String())
+            SyncLock _lockObject
+                For Each appName In appNames
+                    Dim appInfo = _monitoredApplications.FirstOrDefault(Function(a) a.Config.Name = appName)
+                    If appInfo IsNot Nothing Then
+                        Try
+                            LogMessage($"Force-restarting {appName} and all child processes")
+
+                            ' Kill entire process tree
+                            If appInfo.LaunchedProcess IsNot Nothing AndAlso Not appInfo.LaunchedProcess.HasExited Then
+                                KillProcessTree(appInfo.LaunchedProcess)
+                            End If
+
+                            ' Restart application
+                            StartApplication(appInfo)
+                            LogMessage($"Successfully restarted {appName}")
+                        Catch ex As Exception
+                            LogMessage($"Force-restart failed for {appName}: {ex.Message}", True)
+                        End Try
+                    End If
+                Next
+            End SyncLock
+        End Sub
+
+        ' Start an application
+        Private Sub StartApplication(appInfo As ApplicationMonitorInfo)
+            Try
+                ' Clean up any existing process
+                If appInfo.LaunchedProcess IsNot Nothing AndAlso Not appInfo.LaunchedProcess.HasExited Then
+                    Try
+                        KillProcessTree(appInfo.LaunchedProcess)
+                    Catch ex As Exception
+                        LogMessage($"Error cleaning up previous process for {appInfo.Config.Name}: {ex.Message}")
+                    End Try
+                End If
+
+                Dim expandedPath = Environment.ExpandEnvironmentVariables(appInfo.Config.Path)
+                If Not File.Exists(expandedPath) Then
+                    Throw New FileNotFoundException($"Application not found at {expandedPath}")
+                End If
+
+                Dim expandedWorkingDir = Environment.ExpandEnvironmentVariables(appInfo.Config.WorkingDirectory)
+                If Not Directory.Exists(expandedWorkingDir) Then
+                    Throw New DirectoryNotFoundException($"Working directory not found: {expandedWorkingDir}")
+                End If
+
+                Dim startInfo = New ProcessStartInfo With {
+                    .FileName = expandedPath,
+                    .WorkingDirectory = expandedWorkingDir,
+                    .Arguments = appInfo.Config.Arguments,
+                    .UseShellExecute = True
+                }
+
+                appInfo.LaunchedProcess = Process.Start(startInfo)
+                If appInfo.LaunchedProcess Is Nothing Then
+                    Throw New Exception("Process.Start returned Nothing")
+                End If
+
+                appInfo.LastActivityTime = DateTime.Now
+                LogMessage($"Started {appInfo.Config.Name} (PID: {appInfo.LaunchedProcess.Id})")
+            Catch ex As Exception
+                LogMessage($"Failed to start {appInfo.Config.Name}: {ex.Message}", True)
+                Throw
+            End Try
+        End Sub
+
+        ' Restart an application (kill then start)
+        Private Sub RestartApplication(appInfo As ApplicationMonitorInfo)
+            Try
+                If appInfo.LaunchedProcess IsNot Nothing AndAlso Not appInfo.LaunchedProcess.HasExited Then
+                    Try
+                        KillProcessTree(appInfo.LaunchedProcess)
+                    Catch ex As Exception
+                        LogMessage($"Error killing process tree for {appInfo.Config.Name}: {ex.Message}")
+                    End Try
+                End If
+                StartApplication(appInfo)
+            Catch ex As Exception
+                LogMessage($"Failed to restart {appInfo.Config.Name}: {ex.Message}", True)
+                Throw
+            End Try
+        End Sub
+
+        ' Recursively kill process tree (FIXED: using ManagementObjectSearcher)
+        Private Sub KillProcessTree(rootProcess As Process)
+            Try
+                If rootProcess Is Nothing OrElse rootProcess.HasExited Then
+                    Return
+                End If
+
+                ' Get all child processes using WMI
+                Dim searcher As New ManagementObjectSearcher(
+                    $"Select * From Win32_Process Where ParentProcessID={rootProcess.Id}")
+
+                For Each obj As ManagementObject In searcher.Get()
+                    Dim childPid As Integer = Convert.ToInt32(obj("ProcessID"))
+                    Try
+                        Using childProc As Process = Process.GetProcessById(childPid)
+                            If Not childProc.HasExited Then
+                                KillProcessTree(childProc)
+                            End If
+                        End Using
+                    Catch
+                        ' Process already exited
+                    End Try
+                Next
+
+                ' Kill the root process
+                If Not rootProcess.HasExited Then
+                    rootProcess.Kill()
+                    rootProcess.WaitForExit(5000)
+                    LogMessage($"Killed process tree for PID {rootProcess.Id} ({rootProcess.ProcessName})")
+                End If
+            Catch ex As Exception
+                LogMessage($"Error killing process tree (PID {rootProcess.Id}): {ex.Message}")
+            End Try
+        End Sub
+
+        ' Check if process is responding
+        Private Function IsProcessResponding(process As Process) As Boolean
+            If process Is Nothing OrElse process.HasExited Then Return False
+
+            Try
+                Return process.Responding
+            Catch
+                ' For non-UI processes
+                Return True
+            End Try
+        End Function
+
+        ' Log messages to file and event log
+        Private Sub LogMessage(message As String, Optional isError As Boolean = False)
+            Try
+                Dim logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {If(isError, "ERROR: ", "")}{message}"
+                File.AppendAllText(_logFilePath, logMessage & Environment.NewLine)
+
+                If isError Then
+                    EventLog.WriteEntry(Me.ServiceName, message, EventLogEntryType.Error)
+                End If
+            Catch ex As Exception
+                Try
+                    EventLog.WriteEntry(Me.ServiceName, $"Logging failed: {ex.Message}", EventLogEntryType.Error)
+                Catch
+                    ' Final fallback if all logging fails
+                End Try
+            End Try
+        End Sub
+
+        ' Main entry point (FIXED: Console.CancelKeyPress handler)
+        Public Shared Sub Main()
+            If Environment.UserInteractive Then
+                Console.WriteLine("Running in debug mode. Press Ctrl+C to exit...")
+                Dim service As New ApplicationMonitorService()
+                service.OnStart(Nothing)
+                Console.WriteLine("Service running. Monitoring will continue until stopped...")
+
+                ' Fixed: Correct VB.NET syntax for event handler
+                AddHandler Console.CancelKeyPress,
+                    Sub(sender, args)
+                        service.OnStop()
+                        Environment.Exit(0)
+                    End Sub
+
+                Threading.Thread.Sleep(Threading.Timeout.Infinite)
+            Else
+                ServiceBase.Run(New ApplicationMonitorService())
+            End If
+        End Sub
+    End Class
+End Namespace
